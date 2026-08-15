@@ -31,7 +31,8 @@ from pydantic import BaseModel
 
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_community.embeddings import FastEmbedEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 
@@ -58,7 +59,10 @@ if not GOOGLE_API_KEY:
 # Model names are configurable via env vars so they can be updated without
 # touching code if Google renames/deprecates a model.
 GOOGLE_LLM_MODEL: str = os.getenv("GOOGLE_LLM_MODEL", "gemini-3.6-flash")
-GOOGLE_EMBEDDING_MODEL: str = os.getenv("GOOGLE_EMBEDDING_MODEL", "gemini-embedding-001")
+# Local embedding model (runs on CPU via ONNX Runtime, no external API calls
+# or quota). BAAI/bge-small-en-v1.5 is a small (~130MB), well-regarded
+# HuggingFace embedding model -- lightweight enough for Render's free tier.
+LOCAL_EMBEDDING_MODEL: str = os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 
 # Retrieval / chunking tuning constants (kept simple and explainable).
 CHUNK_SIZE = 1000
@@ -108,9 +112,8 @@ class AgentState(TypedDict):
 # 3. Global in-memory state (models + vector store)
 # ---------------------------------------------------------------------------
 
-embeddings = GoogleGenerativeAIEmbeddings(
-    model=GOOGLE_EMBEDDING_MODEL,
-    google_api_key=GOOGLE_API_KEY,
+embeddings = FastEmbedEmbeddings(
+    model_name=LOCAL_EMBEDDING_MODEL,
 )
 
 llm = ChatGoogleGenerativeAI(
@@ -319,7 +322,7 @@ async def health() -> HealthResponse:
         status="ok",
         knowledge_base_ready=vectorstore is not None,
         llm_model=GOOGLE_LLM_MODEL,
-        embedding_model=GOOGLE_EMBEDDING_MODEL,
+        embedding_model=LOCAL_EMBEDDING_MODEL,
     )
 
 
