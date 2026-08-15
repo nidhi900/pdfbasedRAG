@@ -41,7 +41,8 @@ in the source document* is worse than no answer at all.
 ## 4. Features
 
 - **Single-file implementation** (`app.py`) — all logic in one place.
-- **PDF ingestion** via `pypdf` → chunking → embeddings → FAISS index.
+- **PDF ingestion** via `pypdf` → chunking → **local embeddings** (no
+  external API call or quota) → FAISS index.
 - **Combined PDF + question interface** — no separate upload step; a
   custom web page at `/agent/playground/` lets you pick a PDF, type a
   question, and click Start in one action.
@@ -74,7 +75,7 @@ in the source document* is worse than no answer at all.
               ▼
       RecursiveCharacterTextSplitter
               ▼
-      Google Embedding Model
+      Local Embedding Model (fastembed, ONNX, CPU, no API/quota)
               ▼
       FAISS (in-memory, request-scoped knowledge base)
               ▼
@@ -130,7 +131,7 @@ what happens and why unsafe/ungrounded requests never reach the model.
 ```text
 User Question
       ↓
-Embedding (Google embedding model)
+Embedding (local model — no Google API call, no quota)
       ↓
 FAISS Similarity Search (top-K = 4)
       ↓
@@ -142,6 +143,13 @@ LLM (strict grounding prompt)
       ↓
 Answer  (or refusal if context is insufficient)
 ```
+
+**Embeddings vs. generation are split across two different backends:**
+chunk and query embeddings are computed **locally** (no network call, no
+API quota, no cost) via a small ONNX-based embedding model. Only the
+final answer-generation step calls Google Gemini. This avoids Google AI
+Studio's free-tier embedding quota entirely while keeping Gemini for
+what it's actually needed for — reasoning over the retrieved context.
 
 The LLM is instructed to answer **only** from the supplied context and
 to output the exact string `I am not authorized to answer this.` when
@@ -213,9 +221,12 @@ export GOOGLE_API_KEY="your-key-here"
 Optional overrides:
 
 ```bash
-export GOOGLE_LLM_MODEL="gemini-3.6-flash"          # default
-export GOOGLE_EMBEDDING_MODEL="gemini-embedding-001" # default
+export GOOGLE_LLM_MODEL="gemini-3.6-flash"               # default (LLM only)
+export LOCAL_EMBEDDING_MODEL="BAAI/bge-small-en-v1.5"    # default (local, no API key needed)
 ```
+
+Note: `GOOGLE_API_KEY` is only required for the Gemini LLM call. Embeddings
+run entirely locally and need no API key or network access to Google.
 
 ---
 
@@ -260,7 +271,7 @@ curl -X POST http://localhost:8000/agent \
    uvicorn app:app --host 0.0.0.0 --port $PORT
    ```
 5. **Environment variable:** set `GOOGLE_API_KEY` in the Render dashboard
-   (and optionally `GOOGLE_LLM_MODEL` / `GOOGLE_EMBEDDING_MODEL`).
+   (and optionally `GOOGLE_LLM_MODEL` / `LOCAL_EMBEDDING_MODEL`).
 
 **Important:** the FAISS knowledge base is kept **in memory only**.
 On a Render restart or redeploy, the index is cleared and the PDF must
@@ -305,6 +316,11 @@ LLM never called).
   not exhaustive against novel phrasing.
 - No OCR — scanned/image-only PDFs will be rejected at upload time.
 - No PDF table/image understanding — only extracted text is indexed.
+- The local embedding model's weights (~130MB) are downloaded from
+  HuggingFace on first use and cached; the very first request after a
+  fresh deploy/restart will be slightly slower while this download
+  happens. This requires the deployment environment to have outbound
+  internet access to `huggingface.co`.
 
 ---
 
@@ -328,9 +344,10 @@ LLM never called).
 - **LangGraph** — agent orchestration as an explicit state graph
 - **LangServe** — exposes the graph via standard invoke/stream/playground routes
 - **LangChain Core / Community** — prompt templates, FAISS integration
-- **langchain-google-genai** — Google AI Studio LLM + embeddings client
-- **Google Gemini** (`gemini-3.6-flash` by default) — generation
-- **Google Gemini Embedding** (`gemini-embedding-001` by default) — embeddings
+- **langchain-google-genai** — Google AI Studio LLM client (generation only)
+- **Google Gemini** (`gemini-3.6-flash` by default) — answer generation
+- **fastembed** (ONNX Runtime, `BAAI/bge-small-en-v1.5` by default) —
+  local embeddings; no API key, no quota, no network call
 - **FAISS** (`faiss-cpu`) — in-memory vector similarity search
 - **pypdf** — PDF text extraction
 - **Pydantic** — request/response schema validation
