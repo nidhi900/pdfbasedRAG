@@ -25,7 +25,8 @@ import os
 import re
 from typing import List, TypedDict
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from langchain_core.documents import Document
@@ -35,6 +36,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 
 from langgraph.graph import StateGraph, END
+from langchain_core.runnables import RunnableLambda
 
 from langserve import add_routes
 from pypdf import PdfReader
@@ -132,8 +134,8 @@ current_filename: str | None = None
 # ---------------------------------------------------------------------------
 
 _INJECTION_PATTERNS = [
-    r"ignore (all|any|previous|the) (above )?instructions",
-    r"disregard (all|any|previous|the) (above )?instructions",
+    r"ignore (all |any |previous |the |above )+instructions",
+    r"disregard (all |any |previous |the |above )+instructions",
     r"forget (what|everything) (i|you) (told|said)",
     r"forget your (instructions|rules|guidelines)",
     r"you are now",
@@ -321,19 +323,16 @@ async def health() -> HealthResponse:
     )
 
 
-@app.post("/upload-pdf", response_model=UploadResponse)
-async def upload_pdf(file: UploadFile = File(...)) -> UploadResponse:
+def _ingest_pdf(raw_bytes: bytes, filename: str) -> int:
     """
-    Accept a PDF, extract its text, chunk it, embed it, and (re)build the
-    in-memory FAISS knowledge base. A new upload REPLACES any previously
-    indexed PDF (single active knowledge source at a time).
+    Extract, chunk, embed, and index a PDF into the in-memory FAISS store.
+    Replaces any previously indexed PDF. Returns the number of chunks
+    indexed. Raises HTTPException on any validation/extraction failure.
     """
     global vectorstore, current_filename
 
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
+    if not filename or not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=422, detail="Only .pdf files are accepted.")
-
-    raw_bytes = await file.read()
 
     if len(raw_bytes) == 0:
         raise HTTPException(status_code=422, detail="Uploaded file is empty.")
@@ -373,7 +372,7 @@ async def upload_pdf(file: UploadFile = File(...)) -> UploadResponse:
         raise HTTPException(status_code=422, detail="PDF text could not be split into chunks.")
 
     documents = [
-        Document(page_content=chunk, metadata={"source": file.filename, "chunk_index": i})
+        Document(page_content=chunk, metadata={"source": filename, "chunk_index": i})
         for i, chunk in enumerate(chunks)
     ]
 
@@ -384,13 +383,117 @@ async def upload_pdf(file: UploadFile = File(...)) -> UploadResponse:
         raise HTTPException(status_code=502, detail=f"Failed to generate embeddings: {exc}")
 
     vectorstore = new_store
-    current_filename = file.filename
+    current_filename = filename
 
-    return UploadResponse(
-        status="success",
-        filename=file.filename,
-        chunks_indexed=len(documents),
-    )
+    return len(documents)
+
+
+@app.post("/agent/ask", response_model=AgentResponse)
+async def ask_with_pdf(
+    file: UploadFile = File(...),
+    input: str = Form(...),
+) -> AgentResponse:
+    """
+    Single combined endpoint: accepts a PDF and a question together.
+    Ingests the PDF (building a fresh in-memory FAISS knowledge base for
+    it), then runs the LangGraph agent for the question against that
+    knowledge base. This is what the custom playground UI calls.
+    """
+    raw_bytes = await file.read()
+    _ingest_pdf(raw_bytes, file.filename or "")
+
+    initial_state: AgentState = {
+        "input": input,
+        "is_safe": False,
+        "knowledge_base_ready": False,
+        "retrieved_documents": [],
+        "context": "",
+        "answer": "",
+    }
+    final_state = compiled_graph.invoke(initial_state)
+    return AgentResponse(output=final_state["answer"])
+
+
+_PLAYGROUND_HTML = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>PDF RAG Knowledge Agent</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 48px auto; padding: 0 16px; }
+    h1 { font-size: 1.4rem; }
+    label { display: block; font-weight: 600; margin-top: 20px; margin-bottom: 6px; }
+    input[type="text"] { width: 100%; padding: 8px; box-sizing: border-box; font-size: 1rem; }
+    button { margin-top: 20px; padding: 10px 20px; font-size: 1rem; cursor: pointer; }
+    #answer-box { margin-top: 24px; padding: 14px; border: 1px solid #ccc; border-radius: 6px;
+                  min-height: 40px; white-space: pre-wrap; background: #fafafa; }
+    #status { margin-top: 10px; color: #666; font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+  <h1>PDF RAG Knowledge Agent</h1>
+  <p>Upload a PDF and ask a question about it. Answers come only from the uploaded PDF.</p>
+
+  <label for="pdf-input">PDF</label>
+  <input id="pdf-input" type="file" accept="application/pdf" />
+
+  <label for="question-input">Question</label>
+  <input id="question-input" type="text" placeholder="What is Task 1 about?" />
+
+  <button id="start-btn">Start</button>
+  <div id="status"></div>
+
+  <label>Answer</label>
+  <div id="answer-box">—</div>
+
+  <script>
+    document.getElementById("start-btn").addEventListener("click", async () => {
+      const fileInput = document.getElementById("pdf-input");
+      const question = document.getElementById("question-input").value.trim();
+      const statusEl = document.getElementById("status");
+      const answerEl = document.getElementById("answer-box");
+
+      if (!fileInput.files.length) {
+        statusEl.textContent = "Please choose a PDF file.";
+        return;
+      }
+      if (!question) {
+        statusEl.textContent = "Please enter a question.";
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append("file", fileInput.files[0]);
+      formData.append("input", question);
+
+      statusEl.textContent = "Processing...";
+      answerEl.textContent = "—";
+
+      try {
+        const res = await fetch("/agent/ask", { method: "POST", body: formData });
+        const data = await res.json();
+        if (!res.ok) {
+          statusEl.textContent = "Error";
+          answerEl.textContent = data.detail || "Something went wrong.";
+          return;
+        }
+        statusEl.textContent = "Done.";
+        answerEl.textContent = data.output;
+      } catch (err) {
+        statusEl.textContent = "Request failed.";
+        answerEl.textContent = String(err);
+      }
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/agent/playground/", response_class=HTMLResponse)
+async def custom_playground() -> HTMLResponse:
+    """Custom PDF + question UI (replaces LangServe's default playground)."""
+    return HTMLResponse(content=_PLAYGROUND_HTML)
 
 
 @app.post("/agent", response_model=AgentResponse)
@@ -414,9 +517,47 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
 # ---------------------------------------------------------------------------
 # 9. LangServe wiring (adds /agent/invoke, /agent/stream, /agent/playground/)
 # ---------------------------------------------------------------------------
+#
+# LangServe generates its Playground form directly from the Runnable's
+# input/output schema. Mounting the compiled LangGraph itself would expose
+# every internal AgentState field (is_safe, knowledge_base_ready,
+# retrieved_documents, context, answer) as user-editable inputs, since
+# LangGraph's state IS the graph's input/output schema.
+#
+# To keep AgentState fully internal, we wrap the graph in a thin
+# RunnableLambda that only ever talks to LangServe using AgentRequest /
+# AgentResponse. It builds the full internal state (with sensible
+# defaults) before invoking the graph, and strips the result back down
+# to just the final answer afterwards.
+
+def _run_pdf_rag_agent(request: AgentRequest | dict) -> AgentResponse:
+    """LangServe-facing entry point: input -> output only.
+
+    LangServe validates against AgentRequest for the schema/Playground
+    form, but may pass a plain dict at call time depending on transport
+    (invoke vs stream vs playground) -- accept either.
+    """
+    user_input = request.input if isinstance(request, AgentRequest) else request["input"]
+    initial_state: AgentState = {
+        "input": user_input,
+        "is_safe": False,
+        "knowledge_base_ready": False,
+        "retrieved_documents": [],
+        "context": "",
+        "answer": "",
+    }
+    final_state = compiled_graph.invoke(initial_state)
+    return AgentResponse(output=final_state["answer"])
+
+
+playground_runnable = RunnableLambda(_run_pdf_rag_agent).with_types(
+    input_type=AgentRequest,
+    output_type=AgentResponse,
+)
 
 add_routes(
     app,
-    compiled_graph,
+    playground_runnable,
     path="/agent",
+    disabled_endpoints=["playground"],
 )
