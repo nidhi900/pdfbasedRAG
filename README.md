@@ -42,14 +42,17 @@ in the source document* is worse than no answer at all.
 
 - **Single-file implementation** (`app.py`) — all logic in one place.
 - **PDF ingestion** via `pypdf` → chunking → embeddings → FAISS index.
+- **Combined PDF + question interface** — no separate upload step; a
+  custom web page at `/agent/playground/` lets you pick a PDF, type a
+  question, and click Start in one action.
 - **Strict RAG pipeline**: retrieval happens before every answer.
 - **Two-layer guardrails**: a pre-retrieval pattern-based screen for
   injection/jailbreak attempts, and a post-retrieval grounding check
   that refuses when retrieved context doesn't support an answer.
 - **LangGraph `StateGraph` orchestration** with explicit nodes and
   conditional routing.
-- **FastAPI JSON API** (`/upload-pdf`, `/agent`) plus a **LangServe
-  playground** for interactive demos.
+- **FastAPI JSON API** (`/agent/ask`, `/agent`) plus a **LangServe
+  API** (`/agent/invoke`, `/agent/stream`) for programmatic access.
 - **Configurable model names** via environment variables.
 - **Render-ready** deployment.
 
@@ -58,29 +61,37 @@ in the source document* is worse than no answer at all.
 ## 5. Architecture
 
 ```text
-┌─────────────┐     ┌──────────────┐     ┌───────────────┐
-│  POST        │────▶│ pypdf extract │────▶│ RecursiveChar  │
-│  /upload-pdf │     │ text          │     │ TextSplitter   │
-└─────────────┘     └──────────────┘     └───────┬───────┘
-                                                    ▼
-                                          ┌──────────────────┐
-                                          │ Google Embedding  │
-                                          │ Model              │
-                                          └────────┬──────────┘
-                                                    ▼
-                                          ┌──────────────────┐
-                                          │ FAISS (in-memory)  │
-                                          └──────────────────┘
-
-┌─────────────┐
-│ POST /agent  │──▶ LangGraph StateGraph (see workflow below) ──▶ answer
-└─────────────┘
+┌──────────────────────────┐
+│ GET /agent/playground/     │  custom HTML page: PDF picker + question box
+└─────────────┬─────────────┘
+              │ (Start clicked)
+              ▼
+┌──────────────────────────┐
+│ POST /agent/ask            │  multipart: file + input, in ONE request
+└─────────────┬─────────────┘
+              ▼
+      pypdf extract text
+              ▼
+      RecursiveCharacterTextSplitter
+              ▼
+      Google Embedding Model
+              ▼
+      FAISS (in-memory, request-scoped knowledge base)
+              ▼
+      LangGraph StateGraph  (see workflow below)  ──▶  answer
 ```
 
 The FastAPI app holds two pieces of global in-memory state: the FAISS
-vector store (`None` until a PDF is uploaded) and the current filename.
-A new `/upload-pdf` call replaces the existing index — only one PDF is
-"active" at a time.
+vector store (`None` until a PDF is processed) and the current
+filename. Each call to `/agent/ask` ingests the submitted PDF and
+replaces the existing index before answering — only one PDF is
+"active" at a time, and it's built fresh as part of the same request
+that asks the question (no separate upload step).
+
+The LangServe routes (`/agent/invoke`, `/agent/stream`) remain
+available for programmatic, text-only follow-up questions against
+whichever PDF was most recently processed via `/agent/ask` — useful
+for scripting further questions without re-uploading the file.
 
 ---
 
@@ -176,9 +187,10 @@ likely add an LLM-based or moderation-API classifier on top of this
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/` | Health/status check; reports whether a PDF is indexed and which models are configured. |
-| `POST` | `/upload-pdf` | Upload a PDF (multipart form, field `file`). Extracts, chunks, embeds, and indexes it. |
-| `POST` | `/agent` | Ask a question. Body: `{"input": "..."}`. Response: `{"output": "..."}`. |
-| `POST`/`GET` | `/agent/invoke`, `/agent/stream`, `/agent/playground/` | LangServe-provided routes for the same underlying graph. |
+| `GET` | `/agent/playground/` | Custom web UI: pick a PDF, type a question, click Start. |
+| `POST` | `/agent/ask` | Combined endpoint: multipart form with a PDF (`file`) and a question (`input`) together. Response: `{"output": "..."}`. This is what the custom UI calls. |
+| `POST` | `/agent` | Text-only question against whichever PDF was most recently processed. Body: `{"input": "..."}`. Response: `{"output": "..."}`. |
+| `POST` | `/agent/invoke`, `/agent/stream` | LangServe-provided routes for the same text-only agent (JSON API, no file upload support). |
 
 ---
 
@@ -214,21 +226,23 @@ uvicorn app:app --reload --port 8000
 ```
 
 - API docs: `http://localhost:8000/docs`
-- LangServe playground: `http://localhost:8000/agent/playground/`
+- **Custom web UI (primary interface):** `http://localhost:8000/agent/playground/`
+  — pick a PDF, type a question, click **Start**.
 
-Upload a PDF:
+Or via curl, PDF and question together in one request:
 
 ```bash
-curl -X POST http://localhost:8000/upload-pdf \
-  -F "file=@DBMS.pdf"
+curl -X POST http://localhost:8000/agent/ask \
+  -F "file=@DBMS.pdf" \
+  -F "input=What is normalization?"
 ```
 
-Ask a question:
+Follow-up text-only questions against the same in-memory PDF:
 
 ```bash
 curl -X POST http://localhost:8000/agent \
   -H "Content-Type: application/json" \
-  -d '{"input": "What is normalization?"}'
+  -d '{"input": "Explain functional dependency."}'
 ```
 
 ---
@@ -250,8 +264,8 @@ curl -X POST http://localhost:8000/agent \
 
 **Important:** the FAISS knowledge base is kept **in memory only**.
 On a Render restart or redeploy, the index is cleared and the PDF must
-be re-uploaded via `/upload-pdf` before `/agent` will return answers
-again.
+be submitted again via `/agent/playground/` (or `/agent/ask`) before
+further text-only `/agent` questions will return answers.
 
 ---
 
